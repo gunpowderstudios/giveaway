@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>IG Giveaway Picker (Browser)</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; line-height: 1.35; }
+    h1 { margin: 0 0 8px; }
+    .muted { color: #666; }
+    textarea { width: 100%; min-height: 200px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 13px; padding: 12px; box-sizing: border-box; }
+    button { padding: 10px 14px; margin: 8px 8px 8px 0; cursor: pointer; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 14px; margin-top: 14px; }
+    .pill { display: inline-block; padding: 2px 8px; border: 1px solid #ddd; border-radius: 999px; font-size: 12px; margin-left: 6px; }
+    .winner { font-size: 22px; font-weight: 700; }
+    .warn { background: #fff7e6; border: 1px solid #ffd58a; padding: 10px; border-radius: 10px; }
+    .ok { background: #f0fff4; border: 1px solid #9ae6b4; padding: 10px; border-radius: 10px; }
+    .small { font-size: 13px; }
+    ul { margin: 6px 0 0 18px; }
+    code { background: #f6f6f6; padding: 2px 6px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <h1>Instagram Giveaway Picker (Browser)</h1>
+  <div class="muted small">
+    Paste your <code>likers.json</code> (copied from the Network tab response). This tool filters to users who are
+    <b>followed_by = true</b> and picks a winner using secure browser randomness.
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <button id="btnExample">Load example JSON</button>
+      <button id="btnParse">Find eligible users</button>
+      <button id="btnPick" disabled>Pick winner</button>
+      <button id="btnExport" disabled>Export audit log</button>
+      <button id="btnReset">Reset</button>
+    </div>
+    <textarea id="jsonInput" placeholder='Paste JSON here (must include {"users":[...]} )'></textarea>
+  </div>
+
+  <div id="status" class="card">
+    <b>Status:</b> Waiting for JSON…
+  </div>
+
+  <div id="results" class="card" style="display:none;">
+    <div><b>Counts</b></div>
+    <div class="small">
+      Total users in JSON: <span id="countTotal">0</span><br/>
+      Eligible (following you): <span id="countEligible">0</span><br/>
+      Not eligible: <span id="countIneligible">0</span>
+      <span class="pill" id="hashPill" title="A simple fingerprint of the input data">data hash: —</span>
+    </div>
+
+    <div class="card warn" style="margin-top:12px;">
+      <b>Reminder:</b> The selected participant is only a winner if they also shared the post to their story
+      and tagged your account (check your DMs / mentions).
+    </div>
+
+    <div class="card ok" style="margin-top:12px;">
+      <div><b>Winner</b></div>
+      <div class="winner" id="winner">—</div>
+      <div class="small muted" id="winnerMeta"></div>
+    </div>
+
+    <details style="margin-top:12px;">
+      <summary><b>Show ineligible usernames</b> (for transparency)</summary>
+      <ul id="ineligibleList"></ul>
+    </details>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+
+    let parsed = null;
+    let eligibleUsers = [];
+    let ineligibleUsers = [];
+    let auditLog = {
+      createdAtISO: null,
+      inputHash: null,
+      totalUsers: 0,
+      eligibleCount: 0,
+      ineligibleCount: 0,
+      winner: null,
+      notes: [
+        "Eligible users are those where friendship_status.followed_by === true (liked + follows you).",
+        "Story shares/tagging cannot be verified automatically; check DMs/mentions to confirm."
+      ]
+    };
+
+    function setStatus(html) {
+      $("status").innerHTML = "<b>Status:</b> " + html;
+    }
+
+    async function sha256Hex(str) {
+      const data = new TextEncoder().encode(str);
+      const hashBuf = await crypto.subtle.digest("SHA-256", data);
+      const hashArr = Array.from(new Uint8Array(hashBuf));
+      return hashArr.map(b => b.toString(16).padStart(2, "0")).join("");
+    }
+
+    function secureRandomInt(min, maxExclusive) {
+      if (!Number.isInteger(min) || !Number.isInteger(maxExclusive) || maxExclusive <= min) {
+        throw new Error("Invalid range");
+      }
+      const range = maxExclusive - min;
+
+      // Rejection sampling to avoid modulo bias
+      const maxUint32 = 0xFFFFFFFF;
+      const limit = Math.floor((maxUint32 + 1) / range) * range;
+
+      while (true) {
+        const arr = new Uint32Array(1);
+        crypto.getRandomValues(arr);
+        const x = arr[0];
+        if (x < limit) {
+          return min + (x % range);
+        }
+      }
+    }
+
+    function safeUsername(u) {
+      return (u && typeof u.username === "string") ? u.username : "(unknown)";
+    }
+
+    function parseAndFilter(obj) {
+      if (!obj || typeof obj !== "object") throw new Error("JSON is not an object.");
+      if (!obj.users || !Array.isArray(obj.users)) throw new Error('Expected JSON to have a "users" array.');
+
+      eligibleUsers = [];
+      ineligibleUsers = [];
+
+      for (const liker of obj.users) {
+        const followedBy = liker?.friendship_status?.followed_by === true;
+        if (followedBy) eligibleUsers.push(liker);
+        else ineligibleUsers.push(liker);
+      }
+    }
+
+    function renderLists() {
+      $("countTotal").textContent = String(auditLog.totalUsers);
+      $("countEligible").textContent = String(auditLog.eligibleCount);
+      $("countIneligible").textContent = String(auditLog.ineligibleCount);
+
+      const ul = $("ineligibleList");
+      ul.innerHTML = "";
+      for (const u of ineligibleUsers) {
+        const li = document.createElement("li");
+        li.textContent = safeUsername(u);
+        ul.appendChild(li);
+      }
+    }
+
+    function renderWinner(w) {
+      if (!w) {
+        $("winner").textContent = "—";
+        $("winnerMeta").textContent = "";
+        return;
+      }
+      $("winner").textContent = "@" + safeUsername(w);
+      const name = w.full_name ? `Name: ${w.full_name}` : "";
+      const id = w.pk ? `ID: ${w.pk}` : "";
+      $("winnerMeta").textContent = [name, id].filter(Boolean).join(" • ");
+    }
+
+    $("btnExample").addEventListener("click", () => {
+      const example = {
+        users: [
+          { username: "alice", full_name: "Alice Example", pk: "1", friendship_status: { followed_by: true } },
+          { username: "bob", full_name: "Bob Example", pk: "2", friendship_status: { followed_by: false } },
+          { username: "charlie", pk: "3", friendship_status: { followed_by: true } }
+        ]
+      };
+      $("jsonInput").value = JSON.stringify(example, null, 2);
+      setStatus("Loaded example JSON. Click <b>Find eligible users</b>.");
+    });
+
+    $("btnParse").addEventListener("click", async () => {
+      const raw = $("jsonInput").value.trim();
+      if (!raw) {
+        setStatus("Please paste your likers JSON first.");
+        return;
+      }
+
+      try {
+        parsed = JSON.parse(raw);
+      } catch (e) {
+        setStatus("That doesn't look like valid JSON. Make sure you pasted the full response.");
+        return;
+      }
+
+      try {
+        parseAndFilter(parsed);
+
+        auditLog.createdAtISO = new Date().toISOString();
+        auditLog.totalUsers = parsed.users.length;
+        auditLog.eligibleCount = eligibleUsers.length;
+        auditLog.ineligibleCount = ineligibleUsers.length;
+        auditLog.winner = null;
+
+        const hash = await sha256Hex(raw);
+        auditLog.inputHash = hash;
+        $("hashPill").textContent = "data hash: " + hash.slice(0, 10) + "…";
+
+        $("results").style.display = "block";
+        renderLists();
+        renderWinner(null);
+
+        $("btnPick").disabled = eligibleUsers.length === 0;
+        $("btnExport").disabled = true;
+
+        setStatus(`Parsed JSON. Found <b>${eligibleUsers.length}</b> eligible user(s).`);
+      } catch (e) {
+        setStatus("Error: " + (e?.message || String(e)));
+      }
+    });
+
+    $("btnPick").addEventListener("click", () => {
+      if (!eligibleUsers.length) {
+        setStatus("No eligible users to pick from.");
+        return;
+      }
+      const idx = secureRandomInt(0, eligibleUsers.length);
+      const w = eligibleUsers[idx];
+
+      auditLog.winner = {
+        username: safeUsername(w),
+        pickedIndex: idx,
+        eligibleCountAtPick: eligibleUsers.length
+      };
+
+      renderWinner(w);
+      $("btnExport").disabled = false;
+
+      setStatus(`Picked a winner at random from <b>${eligibleUsers.length}</b> eligible users.`);
+    });
+
+    $("btnExport").addEventListener("click", () => {
+      const blob = new Blob([JSON.stringify(auditLog, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "giveaway-audit-log.json";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      setStatus("Exported audit log JSON.");
+    });
+
+    $("btnReset").addEventListener("click", () => {
+      $("jsonInput").value = "";
+      $("results").style.display = "none";
+      $("btnPick").disabled = true;
+      $("btnExport").disabled = true;
+      parsed = null;
+      eligibleUsers = [];
+      ineligibleUsers = [];
+      auditLog = {
+        createdAtISO: null,
+        inputHash: null,
+        totalUsers: 0,
+        eligibleCount: 0,
+        ineligibleCount: 0,
+        winner: null,
+        notes: [
+          "Eligible users are those where friendship_status.followed_by === true (liked + follows you).",
+          "Story shares/tagging cannot be verified automatically; check DMs/mentions to confirm."
+        ]
+      };
+      setStatus("Reset. Paste JSON to begin.");
+    });
+
+    setStatus("Paste your likers JSON, then click <b>Find eligible users</b>.");
+  </script>
+</body>
+</html>
